@@ -275,6 +275,7 @@ struct RecordingControlView: View {
                 captureMode = .entireScreen
                 if let window = controlWindow {
                     applyControlBarStyle(to: window, aboveOverlay: false)
+                    positionControlBarNearBottom(window)
                     window.makeKeyAndOrderFront(nil)
                 }
                 NSApp.activate(ignoringOtherApps: true)
@@ -291,6 +292,7 @@ struct RecordingControlView: View {
             }
             if let window = controlWindow {
                 applyControlBarStyle(to: window, aboveOverlay: false)
+                positionControlBarNearBottom(window)
                 window.makeKeyAndOrderFront(nil)
             }
         case .selectingArea:
@@ -543,6 +545,21 @@ struct RecordingControlView: View {
         if !didInitialPositionWindow {
             didInitialPositionWindow = true
             positionControlBarNearBottom(window)
+            DispatchQueue.main.async { [weak window] in
+                guard let window else { return }
+                if case .exporting = model.phase { return }
+                sizeWindowToFitContent(window)
+                positionControlBarNearBottom(window)
+            }
+        }
+    }
+
+    private func sizeWindowToFitContent(_ window: NSWindow) {
+        guard let contentView = window.contentView else { return }
+        contentView.layoutSubtreeIfNeeded()
+        let fitting = contentView.fittingSize
+        if fitting.width > 0 && fitting.height > 0 {
+            window.setContentSize(fitting)
         }
     }
 
@@ -560,6 +577,7 @@ struct RecordingControlView: View {
         window.standardWindowButton(.closeButton)?.isHidden = true
         window.standardWindowButton(.miniaturizeButton)?.isHidden = true
         window.standardWindowButton(.zoomButton)?.isHidden = true
+        sizeWindowToFitContent(window)
     }
 
     private func restoreStandardWindowStyle(to window: NSWindow) {

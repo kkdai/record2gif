@@ -49,6 +49,7 @@ struct Record2GifApp: App {
                     model.statusItemController = appDelegate.statusItemController
                 }
         }
+        .windowResizability(.contentSize)
     }
 
     @ViewBuilder
