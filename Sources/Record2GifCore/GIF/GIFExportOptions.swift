@@ -38,7 +38,14 @@ public enum GIFResolution: Hashable, Sendable, CaseIterable, Identifiable {
 
 public struct GIFExportOptions: Hashable, Sendable {
     public var resolution: GIFResolution = .w960
-    public var fps: Int = 15                            // clamped to 1...50
+    public var fps: Int = 15 {                          // clamped to 1...50
+        didSet {
+            let clamped = Self.clampFPS(fps)
+            if fps != clamped {
+                fps = clamped
+            }
+        }
+    }
     public var loopForever: Bool = true
 
     public init(
@@ -47,18 +54,52 @@ public struct GIFExportOptions: Hashable, Sendable {
         loopForever: Bool = true
     ) {
         self.resolution = resolution
-        self.fps = min(max(fps, 1), 50)
+        self.fps = Self.clampFPS(fps)
         self.loopForever = loopForever
+    }
+
+    private static func clampFPS(_ value: Int) -> Int {
+        min(max(value, 1), 50)
     }
 }
 
 public enum GIFSizing {
     /// Keeps aspect ratio, never upscales, rounds to even integers, min 2×2.
     public static func outputSize(source: CGSize, resolution: GIFResolution) -> CGSize {
-        fatalError("not implemented")
+        guard source.width.isFinite, source.height.isFinite,
+              source.width > 0, source.height > 0 else {
+            return CGSize(width: 2, height: 2)
+        }
+
+        let scaledWidth: CGFloat
+        let scaledHeight: CGFloat
+
+        if let maxWidth = resolution.maxWidth, maxWidth > 0, CGFloat(maxWidth) < source.width {
+            let scale = CGFloat(maxWidth) / source.width
+            scaledWidth = CGFloat(maxWidth)
+            scaledHeight = source.height * scale
+        } else {
+            scaledWidth = source.width
+            scaledHeight = source.height
+        }
+
+        return CGSize(
+            width: CGFloat(roundToEven(scaledWidth)),
+            height: CGFloat(roundToEven(scaledHeight))
+        )
     }
 
     public static func frameCount(duration: TimeInterval, fps: Int) -> Int {
-        fatalError("not implemented")
+        guard duration.isFinite, duration > 0, fps > 0 else { return 1 }
+        return max(1, Int((duration * Double(fps)).rounded(.down)))
+    }
+
+    private static func roundToEven(_ value: CGFloat) -> Int {
+        guard value.isFinite, value > 0 else { return 2 }
+        var rounded = Int((value / 2.0).rounded()) * 2
+        if CGFloat(rounded) > value {
+            rounded -= 2
+        }
+        return max(2, rounded)
     }
 }
