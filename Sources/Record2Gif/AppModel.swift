@@ -13,4 +13,7 @@ final class AppModel: ObservableObject {
 
     @Published var phase: Phase = .idle
     let recorder = ScreenRecorder()
+    weak var statusItemController: StatusItemController?
+    var onStopRecordingRequested: (() -> Void)?
+    var onNewRecordingRequested: (() -> Void)?
 }

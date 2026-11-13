@@ -10,9 +10,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         let controller = StatusItemController()
         controller.onNewRecording = { [weak self] in
-            self?.appModel?.phase = .idle
+            guard let self else { return }
+            if self.appModel?.phase != .recording {
+                self.appModel?.phase = .idle
+                self.appModel?.onNewRecordingRequested?()
+                self.bringMainWindowToFront()
+            }
+        }
+        controller.onStopRecording = { [weak self] in
+            self?.appModel?.onStopRecordingRequested?()
         }
         self.statusItemController = controller
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func bringMainWindowToFront() {
+        let targetWindow = NSApp.windows.first(where: { window in
+            window.identifier?.rawValue == "main" || window.title == "record2gif"
+        }) ?? NSApp.windows.first(where: { window in
+            !(window is NSPanel) && window.className != "NSStatusBarWindow"
+        })
+        targetWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 }
@@ -23,11 +41,12 @@ struct Record2GifApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup("record2gif") {
+        Window("record2gif", id: "main") {
             contentView
                 .environmentObject(model)
                 .onAppear {
                     appDelegate.appModel = model
+                    model.statusItemController = appDelegate.statusItemController
                 }
         }
     }
