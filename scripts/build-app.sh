@@ -18,5 +18,17 @@ cp "$BIN_PATH/Record2Gif" "$MACOS_DIR/record2gif"
 chmod +x "$MACOS_DIR/record2gif"
 cp "$ROOT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
 
-codesign --force --deep -s - "$APP_DIR"
+DEFAULT_IDENTITY="record2gif Local Signing"
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+    IDENTITY="$SIGN_IDENTITY"
+elif security find-identity -p codesigning 2>/dev/null | grep -Fq "\"$DEFAULT_IDENTITY\""; then
+    IDENTITY="$DEFAULT_IDENTITY"
+else
+    IDENTITY="-"
+    echo "Warning: '$DEFAULT_IDENTITY' identity not found in keychain; falling back to ad-hoc signing (-). Screen Recording permission will reset on each rebuild." >&2
+fi
+
+echo "Signing $APP_DIR with identity: $IDENTITY"
+codesign --force --deep --sign "$IDENTITY" "$APP_DIR"
+codesign -dr - "$APP_DIR"
 echo "Built $APP_DIR"
