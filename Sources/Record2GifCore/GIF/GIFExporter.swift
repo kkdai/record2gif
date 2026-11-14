@@ -1,5 +1,7 @@
 import AVFoundation
 import CoreGraphics
+import CoreMedia
+import CoreVideo
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -62,11 +64,30 @@ public final class GIFExporter: Sendable {
         let totalFrames = GIFSizing.frameCount(duration: durationSeconds, fps: fps)
         let frameDelay = 1.0 / Double(fps)
 
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = outputSize
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
+        let reader: AVAssetReader
+        do {
+            reader = try AVAssetReader(asset: asset)
+        } catch {
+            throw GIFExportError.frameExtractionFailed
+        }
+
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+        ]
+        let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
+        trackOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(trackOutput) else {
+            throw GIFExportError.frameExtractionFailed
+        }
+        reader.add(trackOutput)
+        guard reader.startReading() else {
+            throw GIFExportError.frameExtractionFailed
+        }
+        defer {
+            if reader.status == .reading {
+                reader.cancelReading()
+            }
+        }
 
         let fileManager = FileManager.default
         let outputDirectory = output.deletingLastPathComponent()
@@ -112,60 +133,50 @@ public final class GIFExporter: Sendable {
 
             progress(0.0)
 
-            var times: [CMTime] = []
-            times.reserveCapacity(totalFrames)
-            var timeToIndex: [CMTime: Int] = [:]
-            timeToIndex.reserveCapacity(totalFrames)
+            func readNextSample() throws -> DecodedSample? {
+                while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
+                    try Self.checkCancellation()
+                    if CMSampleBufferGetImageBuffer(sampleBuffer) != nil {
+                        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                        return DecodedSample(pts: pts, sampleBuffer: sampleBuffer)
+                    }
+                }
+                try Self.checkCancellation()
+                if reader.status == .failed {
+                    throw GIFExportError.frameExtractionFailed
+                }
+                return nil
+            }
+
+            guard var currentSample = try readNextSample() else {
+                throw GIFExportError.frameExtractionFailed
+            }
+            var nextSample = try readNextSample()
+            let tolerance = CMTime(value: 1, timescale: 100_000)
 
             for frameIndex in 0..<totalFrames {
-                let requestedTime = CMTime(
+                try Self.checkCancellation()
+
+                let targetTime = CMTime(
                     value: CMTimeValue(frameIndex * 600),
                     timescale: CMTimeScale(fps * 600)
                 )
-                times.append(requestedTime)
-                timeToIndex[requestedTime] = frameIndex
-            }
+                let targetWithTolerance = CMTimeAdd(targetTime, tolerance)
 
-            var pendingFrames: [Int: CGImage] = [:]
-            var nextFrameToWrite = 0
-            var completedCount = 0
-
-            for await result in generator.images(for: times) {
-                try Self.checkCancellation()
-
-                let rawImage: CGImage
-                do {
-                    rawImage = try result.image
-                } catch is CancellationError {
-                    throw GIFExportError.cancelled
-                } catch {
-                    if Task.isCancelled {
-                        throw GIFExportError.cancelled
-                    }
-                    throw GIFExportError.frameExtractionFailed
+                while let candidate = nextSample,
+                      CMTimeCompare(candidate.pts, targetWithTolerance) <= 0 {
+                    currentSample = candidate
+                    nextSample = try readNextSample()
                 }
 
                 try Self.checkCancellation()
 
-                let normalizedImage = try Self.ensureSize(rawImage, matches: outputSize)
-                let frameIndex = timeToIndex[result.requestedTime]
-                    ?? times.firstIndex(where: { CMTimeCompare($0, result.requestedTime) == 0 })
-                    ?? nextFrameToWrite
-                pendingFrames[frameIndex] = normalizedImage
-
-                while let readyImage = pendingFrames.removeValue(forKey: nextFrameToWrite) {
-                    CGImageDestinationAddImage(destination, readyImage, frameProperties as CFDictionary)
-                    nextFrameToWrite += 1
-                }
-
-                completedCount += 1
-                progress(Double(completedCount) / Double(totalFrames))
-            }
-
-            try Self.checkCancellation()
-
-            guard nextFrameToWrite == totalFrames else {
-                throw GIFExportError.frameExtractionFailed
+                let frameImage = try currentSample.renderedImage(
+                    outputSize: outputSize,
+                    preferredTransform: preferredTransform
+                )
+                CGImageDestinationAddImage(destination, frameImage, frameProperties as CFDictionary)
+                progress(Double(frameIndex + 1) / Double(totalFrames))
             }
 
             try Self.checkCancellation()
@@ -196,17 +207,51 @@ public final class GIFExporter: Sendable {
         }
     }
 
-    private static func ensureSize(_ image: CGImage, matches targetSize: CGSize) throws -> CGImage {
-        let targetWidth = max(2, Int(targetSize.width.rounded()))
-        let targetHeight = max(2, Int(targetSize.height.rounded()))
-        if image.width == targetWidth && image.height == targetHeight {
-            return image
+    fileprivate static func renderAndScale(
+        sampleBuffer: CMSampleBuffer,
+        to targetSize: CGSize,
+        preferredTransform: CGAffineTransform
+    ) throws -> CGImage {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            throw GIFExportError.frameExtractionFailed
         }
 
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
-            ?? image.colorSpace
-            ?? CGColorSpaceCreateDeviceRGB()
-        guard let context = CGContext(
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            throw GIFExportError.frameExtractionFailed
+        }
+
+        let rawWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let rawHeight = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard rawWidth > 0, rawHeight > 0 else {
+            throw GIFExportError.frameExtractionFailed
+        }
+
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
+            | CGBitmapInfo.byteOrder32Little.rawValue
+
+        guard let sourceContext = CGContext(
+            data: baseAddress,
+            width: rawWidth,
+            height: rawHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ), let rawImage = sourceContext.makeImage() else {
+            throw GIFExportError.frameExtractionFailed
+        }
+
+        let targetWidth = max(2, Int(targetSize.width.rounded()))
+        let targetHeight = max(2, Int(targetSize.height.rounded()))
+
+        guard let destContext = CGContext(
             data: nil,
             width: targetWidth,
             height: targetHeight,
@@ -218,18 +263,81 @@ public final class GIFExporter: Sendable {
             throw GIFExportError.frameExtractionFailed
         }
 
-        context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
-        guard let resized = context.makeImage() else {
+        destContext.interpolationQuality = .high
+
+        if preferredTransform.isIdentity {
+            destContext.draw(rawImage, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+        } else {
+            let rawSize = CGSize(width: rawWidth, height: rawHeight)
+            let transformedBounds = CGRect(origin: .zero, size: rawSize).applying(preferredTransform)
+            let orientedWidth = max(1, abs(transformedBounds.width))
+            let orientedHeight = max(1, abs(transformedBounds.height))
+            let normalizedTransform = preferredTransform.concatenating(
+                CGAffineTransform(translationX: -transformedBounds.minX, y: -transformedBounds.minY)
+            )
+
+            destContext.scaleBy(
+                x: CGFloat(targetWidth) / orientedWidth,
+                y: CGFloat(targetHeight) / orientedHeight
+            )
+            destContext.translateBy(x: 0, y: orientedHeight)
+            destContext.scaleBy(x: 1, y: -1)
+            destContext.concatenate(normalizedTransform)
+            destContext.translateBy(x: 0, y: rawSize.height)
+            destContext.scaleBy(x: 1, y: -1)
+            destContext.draw(rawImage, in: CGRect(origin: .zero, size: rawSize))
+        }
+
+        guard let outputImage = destContext.makeImage() else {
             throw GIFExportError.frameExtractionFailed
         }
-        return resized
+        return outputImage
     }
 }
 
-public enum GIFExportError: Error, Equatable, Sendable {
+private struct DecodedSample {
+    let pts: CMTime
+    let sampleBuffer: CMSampleBuffer
+    private var cachedImage: CGImage?
+
+    init(pts: CMTime, sampleBuffer: CMSampleBuffer) {
+        self.pts = pts
+        self.sampleBuffer = sampleBuffer
+    }
+
+    mutating func renderedImage(
+        outputSize: CGSize,
+        preferredTransform: CGAffineTransform
+    ) throws -> CGImage {
+        if let cachedImage {
+            return cachedImage
+        }
+        let image = try GIFExporter.renderAndScale(
+            sampleBuffer: sampleBuffer,
+            to: outputSize,
+            preferredTransform: preferredTransform
+        )
+        cachedImage = image
+        return image
+    }
+}
+
+public enum GIFExportError: Error, LocalizedError, Equatable, Sendable {
     case noVideoTrack
     case frameExtractionFailed
     case encodeFailed
     case cancelled
+
+    public var errorDescription: String? {
+        switch self {
+        case .noVideoTrack:
+            return "The recording does not contain a readable video track."
+        case .frameExtractionFailed:
+            return "Failed to decode frames from the recording."
+        case .encodeFailed:
+            return "Failed to encode the animated GIF file."
+        case .cancelled:
+            return "GIF export was cancelled."
+        }
+    }
 }

@@ -136,6 +136,20 @@ struct GIFSizingTests {
         #expect(GIFSizing.frameCount(duration: 0.0, fps: 15) == 1)
         #expect(GIFSizing.frameCount(duration: -1.0, fps: 15) == 1)
     }
+
+    @Test("GIFExportError provides human-readable LocalizedError descriptions")
+    func errorDescriptions() {
+        let errors: [GIFExportError] = [
+            .noVideoTrack,
+            .frameExtractionFailed,
+            .encodeFailed,
+            .cancelled
+        ]
+        for error in errors {
+            #expect(error.errorDescription != nil)
+            #expect(!error.localizedDescription.contains("GIFExportError error"))
+        }
+    }
 }
 
 @Suite("GIF Exporter Integration Tests")
@@ -278,6 +292,216 @@ struct GIFExporterTests {
         #expect(!FileManager.default.fileExists(atPath: gifURL.path))
         let remainingFiles = (try? FileManager.default.contentsOfDirectory(atPath: tempDir.path)) ?? []
         #expect(remainingFiles == ["input.mov"])
+    }
+
+    @Test("Export VFR video with irregular PTS, long gap, and extended endSession at 10 and 20 fps")
+    func exportVFRVideoHoldsFramesAcrossGaps() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("record2gif-vfr-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let videoURL = tempDir.appendingPathComponent("vfr.mov")
+        let samples: [(seconds: Double, r: CGFloat, g: CGFloat, b: CGFloat)] = [
+            (0.00, 0.0, 0.0, 1.0), // initial blue
+            (0.05, 0.0, 0.0, 1.0), // blue
+            (0.10, 1.0, 0.0, 0.0), // red before 1.5s gap (held across 0.10..<1.60)
+            (1.60, 0.0, 1.0, 0.0), // green burst start
+            (1.63, 0.0, 1.0, 0.0),
+            (1.67, 0.0, 1.0, 0.0),
+            (1.72, 0.0, 0.0, 1.0)  // blue held until endSession (2.30s)
+        ]
+        let sessionEndSeconds = 2.30
+
+        try await Self.generateVFRTestVideo(
+            at: videoURL,
+            width: 640,
+            height: 360,
+            samples: samples,
+            endSessionSeconds: sessionEndSeconds
+        )
+
+        let asset = AVURLAsset(url: videoURL)
+        let loadedDuration = try await asset.load(.duration)
+        let durationSeconds = CMTimeGetSeconds(loadedDuration)
+
+        let exporter = GIFExporter()
+
+        for fps in [10, 20] {
+            let gifURL = tempDir.appendingPathComponent("vfr-\(fps)fps.gif")
+            let options = GIFExportOptions(resolution: .w320, fps: fps, loopForever: true)
+            try await exporter.export(video: videoURL, to: gifURL, options: options) { _ in }
+
+            guard let source = CGImageSourceCreateWithURL(gifURL as CFURL, nil) else {
+                Issue.record("Failed to open VFR GIF at \(fps)fps")
+                continue
+            }
+
+            let expectedCount = Int((durationSeconds * Double(fps)).rounded(.down))
+            let actualCount = CGImageSourceGetCount(source)
+            #expect(actualCount == expectedCount)
+
+            // Frame at t = 0.10s (index 1 at 10fps, index 2 at 20fps) is the held RED frame
+            let gapStartFrameIndex = fps == 10 ? 1 : 2
+            // Frame at t = 0.80s (middle of the 1.5s gap: index 8 at 10fps, index 16 at 20fps)
+            let midGapFrameIndex = fps == 10 ? 8 : 16
+            // Frame at t = 1.40s (near end of the 1.5s gap: index 14 at 10fps, index 28 at 20fps)
+            let lateGapFrameIndex = fps == 10 ? 14 : 28
+            // Frame at t = 2.00s (in extended endSession tail: index 20 at 10fps, index 40 at 20fps)
+            let tailFrameIndex = fps == 10 ? 20 : 40
+
+            let heldStartRGB = try Self.sampleCenterPixel(from: source, at: gapStartFrameIndex)
+            let midGapRGB = try Self.sampleCenterPixel(from: source, at: midGapFrameIndex)
+            let lateGapRGB = try Self.sampleCenterPixel(from: source, at: lateGapFrameIndex)
+            let tailRGB = try Self.sampleCenterPixel(from: source, at: tailFrameIndex)
+
+            // Red dominant at gap start and held identically across the gap
+            #expect(heldStartRGB.r > 200 && heldStartRGB.g < 50 && heldStartRGB.b < 50)
+            #expect(midGapRGB == heldStartRGB)
+            #expect(lateGapRGB == heldStartRGB)
+
+            // Blue dominant in extended endSession tail
+            #expect(tailRGB.b > 200 && tailRGB.r < 50 && tailRGB.g < 50)
+        }
+
+        // Also export at .original resolution (10fps) and verify EVERY frame's colour
+        let originalGifURL = tempDir.appendingPathComponent("vfr-original-10fps.gif")
+        let originalOptions = GIFExportOptions(resolution: .original, fps: 10, loopForever: true)
+        try await exporter.export(video: videoURL, to: originalGifURL, options: originalOptions) { _ in }
+
+        guard let originalSource = CGImageSourceCreateWithURL(originalGifURL as CFURL, nil) else {
+            Issue.record("Failed to open VFR .original GIF")
+            return
+        }
+
+        let expectedOriginalCount = Int((durationSeconds * 10.0).rounded(.down))
+        let actualOriginalCount = CGImageSourceGetCount(originalSource)
+        #expect(actualOriginalCount == expectedOriginalCount)
+
+        if let firstOriginalFrame = CGImageSourceCreateImageAtIndex(originalSource, 0, nil) {
+            #expect(firstOriginalFrame.width == 640)
+            #expect(firstOriginalFrame.height == 360)
+        }
+
+        for frameIndex in 0..<actualOriginalCount {
+            let t = Double(frameIndex) / 10.0
+            let rgb = try Self.sampleCenterPixel(from: originalSource, at: frameIndex)
+            if t < 0.099 {
+                // 0.00..<0.10 -> Blue
+                #expect(rgb.b > 200 && rgb.r < 50 && rgb.g < 50, "Frame \(frameIndex) at t=\(t) should be blue")
+            } else if t < 1.599 {
+                // 0.10..<1.60 -> Red (held across 1.5s gap)
+                #expect(rgb.r > 200 && rgb.g < 50 && rgb.b < 50, "Frame \(frameIndex) at t=\(t) should be red")
+            } else if t < 1.719 {
+                // 1.60..<1.72 -> Green (burst)
+                #expect(rgb.g > 200 && rgb.r < 50 && rgb.b < 50, "Frame \(frameIndex) at t=\(t) should be green")
+            } else {
+                // 1.72..<2.30 -> Blue (held through extended endSession)
+                #expect(rgb.b > 200 && rgb.r < 50 && rgb.g < 50, "Frame \(frameIndex) at t=\(t) should be blue")
+            }
+        }
+    }
+
+    private static func sampleCenterPixel(
+        from source: CGImageSource,
+        at index: Int
+    ) throws -> (r: UInt8, g: UInt8, b: UInt8) {
+        guard let image = CGImageSourceCreateImageAtIndex(source, index, nil) else {
+            throw GIFExportError.frameExtractionFailed
+        }
+        var pixel: [UInt8] = [0, 0, 0, 0]
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: &pixel,
+            width: 1,
+            height: 1,
+            bitsPerComponent: 8,
+            bytesPerRow: 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw GIFExportError.frameExtractionFailed
+        }
+        let centerX = CGFloat(image.width / 2)
+        let centerY = CGFloat(image.height / 2)
+        context.translateBy(x: -centerX, y: -centerY)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return (pixel[0], pixel[1], pixel[2])
+    }
+
+    private static func generateVFRTestVideo(
+        at url: URL,
+        width: Int,
+        height: Int,
+        samples: [(seconds: Double, r: CGFloat, g: CGFloat, b: CGFloat)],
+        endSessionSeconds: Double
+    ) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        input.expectsMediaDataInRealTime = false
+
+        let attributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height
+        ]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: attributes
+        )
+
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+
+        for sample in samples {
+            while !input.isReadyForMoreMediaData {
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            guard let pool = adaptor.pixelBufferPool else {
+                throw GIFExportError.encodeFailed
+            }
+            var pixelBufferOut: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBufferOut)
+            guard let pixelBuffer = pixelBufferOut else {
+                throw GIFExportError.encodeFailed
+            }
+
+            CVPixelBufferLockBaseAddress(pixelBuffer, [])
+            if let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) {
+                let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+                let colorSpace = CGColorSpaceCreateDeviceRGB()
+                if let context = CGContext(
+                    data: baseAddress,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: bytesPerRow,
+                    space: colorSpace,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                        | CGBitmapInfo.byteOrder32Little.rawValue
+                ) {
+                    context.setFillColor(red: sample.r, green: sample.g, blue: sample.b, alpha: 1.0)
+                    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+
+            let pts = CMTime(seconds: sample.seconds, preferredTimescale: 600)
+            adaptor.append(pixelBuffer, withPresentationTime: pts)
+        }
+
+        input.markAsFinished()
+        writer.endSession(atSourceTime: CMTime(seconds: endSessionSeconds, preferredTimescale: 600))
+        await writer.finishWriting()
+        if let error = writer.error {
+            throw error
+        }
     }
 
     private static func generateTestVideo(
