@@ -26,6 +26,7 @@ struct RecordingControlView: View {
 
     @State private var controlWindow: NSWindow?
     @State private var didInitialPositionWindow: Bool = false
+    @State private var didDisableAutomaticTermination: Bool = false
     @State private var elapsedCancellable: AnyCancellable?
 
     @State private var overlayController = AreaSelectionOverlayController()
@@ -443,6 +444,11 @@ struct RecordingControlView: View {
             excludedIDs.append(CGWindowID(window.windowNumber))
         }
 
+        if !didDisableAutomaticTermination {
+            ProcessInfo.processInfo.disableAutomaticTermination("Recording")
+            didDisableAutomaticTermination = true
+        }
+
         overlayController.dismiss()
         controlWindow?.orderOut(nil)
         model.phase = .recording
@@ -510,6 +516,10 @@ struct RecordingControlView: View {
         elapsedCancellable?.cancel()
         elapsedCancellable = nil
         model.statusItemController?.showIdle()
+        if didDisableAutomaticTermination {
+            ProcessInfo.processInfo.enableAutomaticTermination("Recording")
+            didDisableAutomaticTermination = false
+        }
     }
 
     private func presentError(_ error: Error) {
