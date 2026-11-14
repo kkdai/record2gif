@@ -12,6 +12,8 @@ final class StatusItemController: NSObject {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.idleMenu = NSMenu()
         super.init()
+        self.statusItem.autosaveName = "com.kkdai.record2gif.statusItem"
+        self.statusItem.isVisible = true
         setupMenu()
         showIdle()
     }
@@ -37,11 +39,13 @@ final class StatusItemController: NSObject {
     }
 
     func showIdle() {
+        statusItem.isVisible = true
         guard let button = statusItem.button else { return }
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
         let image = NSImage(
             systemSymbolName: "record.circle",
             accessibilityDescription: "record2gif"
-        )
+        )?.withSymbolConfiguration(symbolConfig)
         image?.isTemplate = true
         button.image = image
         button.title = ""
@@ -52,27 +56,27 @@ final class StatusItemController: NSObject {
     }
 
     func showRecording(elapsed: TimeInterval) {
+        statusItem.isVisible = true
         guard let button = statusItem.button else { return }
         let totalSeconds = max(0, Int(elapsed.rounded(.down)))
         let minutes = totalSeconds / 60
         let seconds = totalSeconds % 60
         let timeString = String(format: "%02d:%02d", minutes, seconds)
 
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
         let image = NSImage(
             systemSymbolName: "stop.circle.fill",
             accessibilityDescription: "Stop Recording"
-        )
+        )?.withSymbolConfiguration(symbolConfig)
         image?.isTemplate = true
         button.image = image
+        button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
         button.title = " \(timeString)"
         button.imagePosition = .imageLeading
-        if onStopRecording != nil {
-            statusItem.menu = nil
-            button.target = self
-            button.action = #selector(handleStopRecording)
-        } else {
-            statusItem.menu = idleMenu
-        }
+        statusItem.menu = nil
+        button.target = self
+        button.action = #selector(handleStopRecording)
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
 
     @objc private func handleNewRecording() {

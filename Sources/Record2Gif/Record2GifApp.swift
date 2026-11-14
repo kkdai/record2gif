@@ -3,8 +3,18 @@ import SwiftUI
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var statusItemController: StatusItemController?
-    weak var appModel: AppModel?
+    var statusItemController: StatusItemController? {
+        didSet {
+            appModel?.statusItemController = statusItemController
+        }
+    }
+    weak var appModel: AppModel? {
+        didSet {
+            if let statusItemController {
+                appModel?.statusItemController = statusItemController
+            }
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -21,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.appModel?.onStopRecordingRequested?()
         }
         self.statusItemController = controller
+        self.appModel?.statusItemController = controller
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -50,7 +61,9 @@ struct Record2GifApp: App {
                 .environmentObject(model)
                 .onAppear {
                     appDelegate.appModel = model
-                    model.statusItemController = appDelegate.statusItemController
+                    if let controller = appDelegate.statusItemController {
+                        model.statusItemController = controller
+                    }
                 }
         }
         .windowResizability(.contentSize)

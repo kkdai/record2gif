@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import CoreGraphics
 import Record2GifCore
 import SwiftUI
@@ -27,7 +26,6 @@ struct RecordingControlView: View {
     @State private var controlWindow: NSWindow?
     @State private var didInitialPositionWindow: Bool = false
     @State private var didDisableAutomaticTermination: Bool = false
-    @State private var elapsedCancellable: AnyCancellable?
 
     @State private var overlayController = AreaSelectionOverlayController()
     @State private var hotKeyMonitor = GlobalHotKeyMonitor()
@@ -460,13 +458,6 @@ struct RecordingControlView: View {
             excludedWindowIDs: Array(Set(excludedIDs))
         )
 
-        model.statusItemController?.showRecording(elapsed: 0)
-        elapsedCancellable = model.recorder.$elapsed
-            .receive(on: RunLoop.main)
-            .sink { [weak model] elapsed in
-                model?.statusItemController?.showRecording(elapsed: elapsed)
-            }
-
         hotKeyMonitor.register {
             Task { @MainActor in
                 await stopRecording()
@@ -513,9 +504,6 @@ struct RecordingControlView: View {
 
     private func cleanupAfterRecordingEnds() {
         hotKeyMonitor.unregister()
-        elapsedCancellable?.cancel()
-        elapsedCancellable = nil
-        model.statusItemController?.showIdle()
         if didDisableAutomaticTermination {
             ProcessInfo.processInfo.enableAutomaticTermination("Recording")
             didDisableAutomaticTermination = false
