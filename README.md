@@ -3,6 +3,9 @@
 Native macOS screen recorder (QuickTime-style) that exports straight to animated GIF with a
 selectable output resolution. See [SPEC.md](SPEC.md).
 
+Blog post (Traditional Chinese) on how it was built with Claude Code as PM and two agy coder
+panes in Herdr: [用 Herdr 開兩個 agy Pane 平行開發：一天做出 macOS 錄影直接轉 GIF 的 record2gif](https://www.evanlin.com/record2gif-macos-screen-to-gif/)
+
 ## Requirements
 
 - macOS 14 or later
